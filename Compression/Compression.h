@@ -21,8 +21,6 @@ enum ClusterAdressing
 	BIT_64 = 8
 };
 
-constexpr char MaskTemplate[9] = { 0x00, 0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF };
-
 struct Compression_Header
 {
 	uint8_t Information;
@@ -74,45 +72,67 @@ public:
 
 	void Compress( T* data, Compression_Header templ )
 	{
-		if ( templ.SizeCluster != 0 && templ.SizeSource != 0 && data != nullptr )
+		if ( templ.SizeSource == 0 && data == nullptr ) return;
+		
+		unsigned long long TotalCluster, LastClusterAdjustment;  
+		if ( templ.SizeCluster == 0 || templ.SizeCluster == templ.SizeSource )
 		{
-			unsigned long long TotalCluster = templ.SizeSource / templ.SizeCluster;
-			unsigned long long LastClusterSize = templ.SizeSource % templ.SizeCluster;
-			if ( LastClusterSize != 0 ) TotalCluster++;
-
-			auto ClusterAddressing = Cluster_Addressing_Size( TotalCluster, templ.SizeSource );
-			this->mData.resize( COMPRESSION_HEADER_SIZE + ClusterAddressing * TotalCluster );
-			templ.Information = ClusterAddressing;
-
-			uint8_t* pData = (uint8_t*) data;
-			for ( unsigned long long i = 0; i < TotalCluster - 1; i++ )
-			{
-				auto compressed = this->Compress_Cluster( &pData[i * templ.SizeCluster], templ.SizeCluster );
-				Store_Cluster_Address( this->mData, ClusterAddressing, i, mData.size() );
-				for ( auto byte : compressed ) mData.push_back( byte );
-			}
-			if ( LastClusterSize != 0 )
-			{
-				auto compressed = this->Compress_Cluster( &pData[( TotalCluster - 1 ) * templ.SizeCluster], LastClusterSize );
-				//store the address of the last cluster
-				if ( TotalCluster > 1 )
-					Store_Cluster_Address( this->mData, ClusterAddressing, TotalCluster - 1, mData.size() );
-				for ( auto byte : compressed ) mData.push_back( byte );
-			}
-			Compression::Create_Compression_Header( this->mData, templ );
+			LastClusterAdjustment = templ.SizeSource;
+			templ.SizeCluster = 0;
+			TotalCluster = 1;
 		}
+		else
+		{
+			TotalCluster = templ.SizeSource / templ.SizeCluster;
+			LastClusterAdjustment = templ.SizeSource % templ.SizeCluster;
+			if ( LastClusterAdjustment != 0 ) TotalCluster++;
+		}
+
+		auto ClusterAddressing = Cluster_Addressing_Size( TotalCluster, templ.SizeSource );
+		this->mData.resize( COMPRESSION_HEADER_SIZE + ClusterAddressing * TotalCluster );
+		templ.Information = ClusterAddressing;
+		uint8_t* pData = (uint8_t*) data;
+	
+		if ( LastClusterAdjustment != 0 ) TotalCluster--; //adjustment for looping, TotalCluster remains the same
+		for ( unsigned long long i = 0; i < TotalCluster; i++ )
+		{
+			auto compressed = this->Compress_Cluster( &pData[i * templ.SizeCluster], templ.SizeCluster );
+			Store_Cluster_Address( this->mData, ClusterAddressing, i, mData.size() );
+			for ( auto byte : compressed ) mData.push_back( byte );
+		}
+		if ( LastClusterAdjustment != 0 )
+		{
+			auto compressed = this->Compress_Cluster( &pData[TotalCluster * templ.SizeCluster], LastClusterAdjustment );
+			if ( TotalCluster > 0 ) Store_Cluster_Address( this->mData, ClusterAddressing, TotalCluster, mData.size() );
+			for ( auto byte : compressed ) mData.push_back( byte );
+		}
+		Compression::Create_Compression_Header( this->mData, templ );	
 	}
 
 	T* Decompress() 
 	{
+		if ( this->mData.empty() ) return nullptr;
+
 		auto compHeader = Compression::Read_Compression_Header( this->mData );
 		uint8_t* decompData = (uint8_t*) malloc( compHeader.SizeSource );
 
-		unsigned long long TotalCluster = compHeader.SizeSource / compHeader.SizeCluster;
-		unsigned long long LastClusterSize = compHeader.SizeSource % compHeader.SizeCluster;
-		if ( LastClusterSize != 0 ) TotalCluster++;
+		unsigned long long TotalCluster, LastClusterAdjustment;
 
-		for ( unsigned long long i = 0; i < TotalCluster - 1; i++ )
+		//no cluster
+		if ( compHeader.SizeCluster == 0 )
+		{
+			LastClusterAdjustment = compHeader.SizeSource;
+			TotalCluster = 1;
+		}
+		else
+		{
+			TotalCluster = compHeader.SizeSource / compHeader.SizeCluster;
+			LastClusterAdjustment = compHeader.SizeSource % compHeader.SizeCluster;
+			if ( LastClusterAdjustment != 0 ) TotalCluster++;
+		}
+
+		if ( LastClusterAdjustment != 0 ) TotalCluster--; //adjustment for looping, TotalCluster remains the same
+		for ( unsigned long long i = 0; i < TotalCluster; i++ )
 		{
 			unsigned long long cAddress = Retrieve_Cluster_Address( this->mData, compHeader.Information, i );
 			auto decompressed = Compression::Decompress_Cluster( (uint8_t*) &this->mData[0], cAddress, compHeader.SizeCluster );
@@ -120,18 +140,71 @@ public:
 			for ( unsigned short j = 0; j < compHeader.SizeCluster; j++ )
 				decompData[i * compHeader.SizeCluster + j] = decompressed[j];
 		}
-		if ( LastClusterSize != 0 )
+		if ( LastClusterAdjustment != 0 )
 		{
 			unsigned long long cAddress = COMPRESSION_HEADER_SIZE;
-			if ( TotalCluster > 1 ) cAddress = Retrieve_Cluster_Address( this->mData, compHeader.Information, TotalCluster-1 );
-			auto decompressed = Compression::Decompress_Cluster( (uint8_t*) &this->mData[0], cAddress, LastClusterSize );
+			if ( TotalCluster > 0 ) cAddress = Retrieve_Cluster_Address( this->mData, compHeader.Information, TotalCluster );
+			auto decompressed = Compression::Decompress_Cluster( (uint8_t*) &this->mData[0], cAddress, LastClusterAdjustment );
 			//decompressed vector size is guaranteed to be last cluster size bytes
-			for ( unsigned short j = 0; j < LastClusterSize; j++ )
-				decompData[(TotalCluster-1) * compHeader.SizeCluster + j] = decompressed[j];
+			for ( unsigned short j = 0; j < LastClusterAdjustment; j++ )
+				decompData[TotalCluster * compHeader.SizeCluster + j] = decompressed[j];
 		}
 		return (T*) decompData;
 	}
 	
+	static unsigned short Dense_Cluster( T* data, unsigned long long size )
+	{
+		size_t SizeAfterCompression = size;
+		unsigned short SizeCluster = 0;
+		unsigned short BestSizeCluster = 0;
+		Compression<T> obj;
+		while ( SizeCluster < size )
+		{
+			Compression_Header header;
+			header.SizeCluster = SizeCluster;
+			header.SizeSource = size;
+			obj.Compress( data, header );
+			if ( obj.Size() < SizeAfterCompression )
+			{
+				SizeAfterCompression = obj.Size();
+				BestSizeCluster = SizeCluster;
+			}
+			SizeCluster++;
+		}
+		return BestSizeCluster;
+	}
+
+	static unsigned short Cluster_Allocation( uint8_t* data, unsigned short size )
+	{
+		bool byte_value[BYTESIZE];
+		for ( unsigned long long i = 0; i < BYTESIZE; i++ ) byte_value[i] = false;
+		for ( unsigned long long i = 0; i < size; i++ )		byte_value[data[i]] = true;
+
+		//generate new value
+		std::vector<uint8_t> list_decoder;
+		std::vector<uint8_t> list_encoded;
+		list_encoded.resize( BYTESIZE );
+		uint8_t new_value = 0;
+		for ( size_t i = 0; i < BYTESIZE; i++ )
+		{
+			if ( byte_value[i] )
+			{
+				list_encoded[i] = new_value;
+				list_decoder.push_back( i );
+				new_value++;
+			}
+		}
+		auto DataLen = Len_Bit( new_value - 1 );
+		auto DecoderLen = Len_Bit( list_decoder.back() );
+
+		unsigned long long Allocation_Data = std::ceil( (double) DataLen * size / 8 );
+		unsigned long long Allocation_Decoder = std::ceil( (double) DecoderLen * new_value / 8 );
+		unsigned long long Allocation_Total = 1 + Allocation_Data + Allocation_Decoder;
+
+		if ( Allocation_Total > size + 1 ) Allocation_Total = size + 1;
+		return Allocation_Total;
+	}
+
 	size_t Size() const { return mData.size(); }
 	bool isEmpty() const { return mData.empty(); }
 	void Delete() { this->mData.clear(); }
@@ -292,7 +365,7 @@ private:
 	{
 		Cluster_Header header;
 		header.DataLength = data[cAddress] >> 4;
-		header.DecoderLength = MaskTemplate[4] & data[cAddress];
+		header.DecoderLength = 0xF & data[cAddress];
 		return header;
 	}
 
@@ -323,6 +396,8 @@ private:
 
 	static uint8_t Extend_Byte( size_t index, uint8_t clen, uint8_t* data, size_t jump_byte )
 	{
+		constexpr char MaskTemplate[9] = { 0x00, 0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F, 0x7F, 0xFF };
+
 		uint8_t byte = 0;
 		size_t start_bit_index = ( clen * index % 8 );
 		size_t first_byte_index = std::floor( (double) clen * index / 8 ) + jump_byte;
